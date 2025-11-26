@@ -27,19 +27,24 @@ project(Led_pwm C CXX ASM)
 pico_sdk_init()
 
 add_executable(${PROJECT_NAME}
-    #DMA_PWM_LED.c
-    DMA_PWM_LED_Debug.c
-    #DMA_PWM_LED_Botao.c
-    )
+    DMA_PWM_LED.c
+    lib/ssd1306.c 
+)
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/lib
+)
 
 target_link_libraries(${PROJECT_NAME}
     pico_stdlib 
     hardware_dma 
     hardware_pwm
+    hardware_i2c
     )
 
 # Em caso de Depuração via UART, desativar USB e ativar UART    
-pico_enable_stdio_usb(${PROJECT_NAME} 0)
+pico_enable_stdio_usb(${PROJECT_NAME} 1)
 pico_enable_stdio_uart(${PROJECT_NAME} 1)
 
 pico_add_extra_outputs(${PROJECT_NAME})
