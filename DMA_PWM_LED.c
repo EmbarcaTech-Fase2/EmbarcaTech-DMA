@@ -6,31 +6,31 @@
 
 #define SERVO_PIN 8
 
-// Servo pulse limits (in microseconds)
+// Limites de pulso do servo (em microssegundos)
 #define SERVO_MIN_US 1000
 #define SERVO_MAX_US 2000
 
-// PWM parameters for 50 Hz
+// Parâmetros do PWM para 50 Hz (20 ms)
 #define CLK_DIV 64.f
-#define PWM_WRAP 39062  // 20ms period with clkdiv 64
+#define PWM_WRAP 39062  // Período de 20 ms com clkdiv 64
 
-// Fade animation buffer
-static uint32_t fade[200]; // 200 steps is mais do que suficiente
+// Buffer de animação "fade" (variação do pulso)
+static uint32_t fade[200]; // 200 passos é mais que suficiente
 static int dma_chan;
 
 ssd1306_t ssd;
 
-// DMA IRQ handler
+// Rotina de interrupção do DMA
 void dma_handler() {
-    dma_hw->ints0 = 1u << dma_chan;   // clear IRQ
-    dma_channel_set_read_addr(dma_chan, fade, true);
+    dma_hw->ints0 = 1u << dma_chan;   // limpa a interrupção
+    dma_channel_set_read_addr(dma_chan, fade, true); // reinicia leitura do buffer
 }
 
 int main() {
     stdio_init_all();
     display_init(&ssd);
 
-    // PWM setup
+    // Configuração do PWM
     gpio_set_function(SERVO_PIN, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(SERVO_PIN);
 
@@ -39,47 +39,51 @@ int main() {
     pwm_config_set_wrap(&cfg, PWM_WRAP);
     pwm_init(slice, &cfg, true);
 
-    // --- BUILD CORRECT SERVO FADE BUFFER (1000 → 2000 us) ---
+    // --- CONSTRUÇÃO DO BUFFER DE PULSOS DO SERVO (1000 → 2000 us) ---
     for (int i = 0; i < 200; i++) {
-        float t = i / 199.0f; // 0 to 1
+        float t = i / 199.0f; // varia de 0 a 1
         float us = SERVO_MIN_US + t * (SERVO_MAX_US - SERVO_MIN_US);  // 1000 → 2000 us
 
-        // Convert microseconds to PWM compare value
+        // Converte microssegundos para valor de PWM
         uint32_t cc = (uint32_t)((us * PWM_WRAP) / 20000.0f);
 
-        // Write into A channel (low 16 bits), B=0
+        // Escreve no canal A (16 bits inferiores). Canal B = 0
         fade[i] = cc;
     }
 
-    // --- DMA SETUP (32-bit writes!) ---
+    // --- CONFIGURAÇÃO DO DMA (escrita de 32 bits) ---
     dma_chan = dma_claim_unused_channel(true);
     dma_channel_config dc = dma_channel_get_default_config(dma_chan);
 
-    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
-    channel_config_set_read_increment(&dc, true);
-    channel_config_set_write_increment(&dc, false);
-    channel_config_set_dreq(&dc, DREQ_PWM_WRAP0 + slice);
+    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);  // escreve 32 bits
+    channel_config_set_read_increment(&dc, true);             // incrementa leitura
+    channel_config_set_write_increment(&dc, false);           // não incrementa escrita
+    channel_config_set_dreq(&dc, DREQ_PWM_WRAP0 + slice);     // sincroniza com PWM
 
     dma_channel_configure(
         dma_chan,
         &dc,
-        &pwm_hw->slice[slice].cc,   // full 32-bit register
-        fade,
-        200,
-        false
+        &pwm_hw->slice[slice].cc,   // registrador CC de 32 bits
+        fade,                       // buffer fonte
+        200,                        // quantidade de elementos
+        false                       // não iniciar ainda
     );
 
+    // Interrupção do DMA
     dma_channel_set_irq0_enabled(dma_chan, true);
     irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    dma_channel_start(dma_chan);
+    dma_channel_start(dma_chan); // inicia DMA
 
-    // --- MAIN LOOP: READ REAL ANGLE + DISPLAY ---
+    // --- LOOP PRINCIPAL: LER PULSO ATUAL + EXIBIR NO OLED ---
     while (true) {
-        uint32_t cc = pwm_hw->slice[slice].cc & 0xFFFF;
+        uint32_t cc = pwm_hw->slice[slice].cc & 0xFFFF; // lê canal A do PWM
 
+        // Converte o valor PWM → microssegundos
         float us = (cc / (float)PWM_WRAP) * 20000.0f;
+
+        // Converte microssegundos → ângulo do servo
         int angle = (int)(((us - SERVO_MIN_US) / (SERVO_MAX_US - SERVO_MIN_US)) * 180.0f);
 
         char buf[32];
