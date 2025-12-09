@@ -4,76 +4,91 @@
 #include "hardware/dma.h"
 #include <stdio.h>
 
-// Definições de pinos
 #define SERVO_PIN 8
-#define PWM_WRAP 256
 
-// Buffer de fade
-static uint16_t fade[PWM_WRAP];
+// Servo pulse limits (in microseconds)
+#define SERVO_MIN_US 1000
+#define SERVO_MAX_US 2000
+
+// PWM parameters for 50 Hz
+#define CLK_DIV 64.f
+#define PWM_WRAP 39062  // 20ms period with clkdiv 64
+
+// Fade animation buffer
+static uint32_t fade[200]; // 200 steps is mais do que suficiente
 static int dma_chan;
+
 ssd1306_t ssd;
 
-// Função de tratamento de DMA
-void dma_handler(){
-    dma_hw->ints0 = 1u << dma_chan; // Limpa a interrupção
-    dma_channel_set_read_addr(dma_chan, fade, true);    // Configura o endereço de leitura
+// DMA IRQ handler
+void dma_handler() {
+    dma_hw->ints0 = 1u << dma_chan;   // clear IRQ
+    dma_channel_set_read_addr(dma_chan, fade, true);
 }
 
-
-int main(){
-    // Inicializações
+int main() {
     stdio_init_all();
     display_init(&ssd);
-    gpio_set_function(SERVO_PIN, GPIO_FUNC_PWM);
-    uint slice_num = pwm_gpio_to_slice_num(SERVO_PIN);
-    
-    // Configuração do PWM
-    pwm_config config = pwm_get_default_config();
-    pwm_config_set_clkdiv(&config, 16.f);
-    pwm_init(slice_num, &config, true);
 
-    // Configuração do buffer de fade
-    for(int i = 0; i < PWM_WRAP/2; i++){
-        fade[i] = (uint16_t)((i * i *2));
-        fade[PWM_WRAP - 1 - i] = fade[i];
+    // PWM setup
+    gpio_set_function(SERVO_PIN, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(SERVO_PIN);
+
+    pwm_config cfg = pwm_get_default_config();
+    pwm_config_set_clkdiv(&cfg, CLK_DIV);
+    pwm_config_set_wrap(&cfg, PWM_WRAP);
+    pwm_init(slice, &cfg, true);
+
+    // --- BUILD CORRECT SERVO FADE BUFFER (1000 → 2000 us) ---
+    for (int i = 0; i < 200; i++) {
+        float t = i / 199.0f; // 0 to 1
+        float us = SERVO_MIN_US + t * (SERVO_MAX_US - SERVO_MIN_US);  // 1000 → 2000 us
+
+        // Convert microseconds to PWM compare value
+        uint32_t cc = (uint32_t)((us * PWM_WRAP) / 20000.0f);
+
+        // Write into A channel (low 16 bits), B=0
+        fade[i] = cc;
     }
 
-    // Configuração do DMA
-    dma_chan = dma_claim_unused_channel(true);  // Atribui um canal de DMA livre
-    dma_channel_config c = dma_channel_get_default_config(dma_chan);    // Configuração padrão do DMA
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);             // Tamanho dos dados: 16 bits
-    channel_config_set_read_increment(&c, true);                        // Incrementa o endereço de leitura
-    channel_config_set_write_increment(&c, false);                       // Não incrementa o endereço de escrita
-    channel_config_set_dreq(&c, DREQ_PWM_WRAP0 + slice_num);            // Define o DREQ do PWM
+    // --- DMA SETUP (32-bit writes!) ---
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config dc = dma_channel_get_default_config(dma_chan);
 
-    // Configuração do PWM e DMA
+    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc, true);
+    channel_config_set_write_increment(&dc, false);
+    channel_config_set_dreq(&dc, DREQ_PWM_WRAP0 + slice);
+
     dma_channel_configure(
         dma_chan,
-        &c,
-        &pwm_hw->slice[slice_num].cc,  // endereço destino (16 bits)
-        fade,                          // endereço fonte
-        PWM_WRAP,                      // número de elementos
-        false                          // não iniciar ainda
+        &dc,
+        &pwm_hw->slice[slice].cc,   // full 32-bit register
+        fade,
+        200,
+        false
     );
 
-    // Configuração da interrupção
-    dma_channel_set_irq0_enabled(dma_chan, true);       // Habilita a interrupção
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);  // Define a função de tratamento
-    irq_set_enabled(DMA_IRQ_0, true);                   // Habilita a interrupção
-    dma_channel_start(dma_chan);                        // Inicia o DMA
+    dma_channel_set_irq0_enabled(dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
 
-    while(true){
-        uint16_t compare_a = (uint16_t)(pwm_hw->slice[slice_num].cc & 0xFFFF);  // Obtem o valor de comparação
-        float duty_ratio = (float)compare_a / 65535.0f;                         // Calcula o duty ratio
-        int angle = (int)(duty_ratio * 180.0f);                                 // Converte para angulo
+    dma_channel_start(dma_chan);
 
-        char buf[32];                                                          // Buffer para armazenar a string
-        snprintf(buf, sizeof(buf), "Angulo: %3d", angle);                      // Formata a string
-        
-        ssd1306_fill(&ssd, false);                                        // Limpa o display
-        ssd1306_draw_string(&ssd, buf, 24, 24);                           // Escreve uma string no display
-        ssd1306_send_data(&ssd);                                          // Atualiza o display
+    // --- MAIN LOOP: READ REAL ANGLE + DISPLAY ---
+    while (true) {
+        uint32_t cc = pwm_hw->slice[slice].cc & 0xFFFF;
 
-        sleep_ms(100);
+        float us = (cc / (float)PWM_WRAP) * 20000.0f;
+        int angle = (int)(((us - SERVO_MIN_US) / (SERVO_MAX_US - SERVO_MIN_US)) * 180.0f);
+
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Angulo: %3d", angle);
+
+        ssd1306_fill(&ssd, false);
+        ssd1306_draw_string(&ssd, buf, 20, 28);
+        ssd1306_send_data(&ssd);
+
+        sleep_ms(150);
     }
 }
